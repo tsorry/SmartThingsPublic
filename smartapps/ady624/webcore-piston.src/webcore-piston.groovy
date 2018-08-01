@@ -18,8 +18,10 @@
  *
  *  Version history
 */
-public static String version() { return "v0.3.104.20180323" }
+public static String version() { return "v0.3.106.20180731" }
 /*
+ *	07/31/2018 >>> v0.3.106.20180731 - BETA M3 - Contact Book removal support
+ *	06/28/2018 >>> v0.3.105.20180628 - BETA M3 - Reorder variables, collapse fuel streams, custom web request body, json and urlEncode functions
  *	03/23/2018 >>> v0.3.104.20180323 - BETA M3 - Fixed unexpected dashboard logouts, updating image urls in tiles, 12 am/pm in time(), unary negation following another operator
  *	02/24/2018 >>> v0.3.000.20180224 - BETA M3 - Dashboard redesign by @acd37, collapsible sidebar, fix "was" conditions on decimal attributes and log failures due to duration threshold
  *	01/16/2018 >>> v0.2.102.20180116 - BETA M2 - Fixed IE 11 script error, display of offset expression evaluation, blank device lists on piston restore, avoid error and log a warning when ST sunrise/sunset is blank
@@ -2781,18 +2783,11 @@ private long vcmd_sendSMSNotification(rtData, device, params) {
 }
 
 private long vcmd_sendNotificationToContacts(rtData, device, params) {
+	// Contact Book has been disabled and we're falling back onto PUSH notifications, if the option is enabled in the SmartApp's settings
+    if (!rtData.redirectContactBook) return 0
 	def message = params[0]
-    List contacts = (params[1] instanceof List ? params[1] : params[1].toString().tokenize(',')).unique();
-	List recipients = rtData.contacts.findAll{ it.key in contacts }.collect{ it.value }
-    if (recipients.size()) {
-        if (recipients && recipients.size()) {
-			def save = !!params[2]
-			sendNotificationToContacts(message, recipients, [event: save, view: [name: "webCoRE", data: [:]]])
-        }
-	} else {
-    	error "Invalid list of contacts: ${params[1]}", rtData
-    }
-    return 0
+    def save = !!params[2]
+    return vcmd_sendPushNotification(rtData, devices, [message, save])
 }
 
 
@@ -3196,9 +3191,19 @@ public localHttpRequestHandler(physicalgraph.device.HubResponse hubResponse) {
 private long vcmd_httpRequest(rtData, device, params) {
 	def uri = params[0].replace(" ", "%20")
 	def method = params[1]
-	def contentType = params[2]
+	def useQueryString = method == 'GET' || method == 'DELETE' || method == 'HEAD'
+	def requestBodyType = params[2]
 	def variables = params[3]
-    def auth = params.size() > 4 ? params[4] : '';
+    def auth = null
+    def requestBody = null
+    def contentType = null
+    if (params.size() == 5) {
+	    auth = params[4];
+    } else if (params.size() == 7) {
+        requestBody = params[4]
+        contentType = params[5] ?: 'text/plain'
+        auth = params[6];
+    }
     if (!uri) return false
 	def protocol = "https"
     def userPart = ""
@@ -3228,7 +3233,9 @@ private long vcmd_httpRequest(rtData, device, params) {
 		}
 	}
 	def data = null
-	if (variables instanceof List) {
+    if (requestBodyType == 'CUSTOM' && !useQueryString) {
+	    data = requestBody
+    } else if (variables instanceof List) {
     	for(variable in variables.findAll{ !!it }) {
         	data  = data ?: [:]
 			data[variable] = getVariable(rtData, variable).v
@@ -3245,8 +3252,8 @@ private long vcmd_httpRequest(rtData, device, params) {
 				headers: [
 					HOST: userPart + ip,
 				] + (auth ? [Authorization: auth] : [:]),
-				query: method == "GET" ? data : null, //thank you @destructure00
-				body: method != "GET" ? data : null //thank you @destructure00
+				query: useQueryString ? data : null, //thank you @destructure00
+				body: !useQueryString ? data : null //thank you @destructure00
 			]
 			sendHubCommand(new physicalgraph.device.HubAction(requestParams, null, [callback: localHttpRequestHandler]))
             return 20000
@@ -3258,10 +3265,10 @@ private long vcmd_httpRequest(rtData, device, params) {
 			if (rtData.logging > 2) debug "Sending external web request to: $uri", rtData
 			def requestParams = [
 				uri:  "${protocol}://${userPart}${uri}",
-				query: method == "GET" ? data : null,
+				query: useQueryString ? data : null,
                 headers: (auth ? [Authorization: auth] : [:]),
-				requestContentType: (method != "GET") && (contentType == "JSON") ? "application/json" : "application/x-www-form-urlencoded",
-				body: method != "GET" ? data : null
+				requestContentType: (method == "GET" || requestBodyType == "FORM") ? "application/x-www-form-urlencoded" : (requestBodyType == "JSON") ? "application/json" : contentType,
+				body: !useQueryString ? data : null
 			]
 			def func = ""
 			switch(method) {
@@ -7133,6 +7140,35 @@ private func_distance(rtData, params) {
 	return [t: 'decimal', v: dist]
 }
 
+/******************************************************************************/
+/*** json encodes data as a JSON string					***/
+/*** Usage: json(value[, pretty])									***/
+/******************************************************************************/
+private func_json(rtData, params) {
+	if (!params || !(params instanceof List) || (params.size() < 1) || (params.size() > 2)) {
+    	return [t: "error", v: "Invalid parameters. Expecting json(value[, format])"];
+    }
+    def builder = new groovy.json.JsonBuilder([params[0].v])
+    def op = params[1] ? 'toPrettyString' : 'toString'
+    def json = builder."${op}"()
+    return [t: 'string', v: json[1..-2].trim()]
+}
+
+/******************************************************************************/
+/*** percent encodes data for use in a URL					***/
+/*** Usage: urlencode(value)									***/
+/******************************************************************************/
+private func_urlencode(rtData, params) {
+	if (!params || !(params instanceof List) || (params.size() != 1)) {
+    	return [t: "error", v: "Invalid parameters. Expecting urlencode(value])"];
+    }
+    // URLEncoder converts spaces to + which is then indistinguishable from any 
+    // actual + characters in the value. Match encodeURIComponent in ECMAScript
+    // which encodes "a+b c" as "a+b%20c" rather than URLEncoder's "a+b+c"
+    def value = (evaluateExpression(rtData, params[0], 'string').v ?: '').replaceAll('\\+', '__wc_plus__')
+    return [t: 'string', v: URLEncoder.encode(value, 'UTF-8').replaceAll('\\+', '%20').replaceAll('__wc_plus__', '+')]
+}
+private func_encodeuricomponent(rtData, params) { return func_urlencode(rtData, params); }
 
 /******************************************************************************/
 /*** 																		***/
